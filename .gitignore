@@ -1,0 +1,46 @@
+# Local settings, credentials, environment-specific files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*credentials*
+*parameters*.json
+*terraform.tfstate*
+*.tfstate*
+*.log
+*.zip
+# AWS console exports and local screenshots should be reviewed before publication
+screenshots/
+local/
+__pycache__/
+.DS_Store
+
+
+# Credentials / auth / machine-local state
+.aws/
+.secrets/
+secrets/
+secrets.*
+*.pfx
+*.p8
+*.kdbx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+*.tfvars
+*.tfvars.json
+*.tfplan
+*.har
+*.pcap
+*.pcapng
+
+# Editors, virtual environments and machine artifacts
+.vscode/
+.idea/
+.venv/
+venv/
+.terraform/
+Thumbs.db

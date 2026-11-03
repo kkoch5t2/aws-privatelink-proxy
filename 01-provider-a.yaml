@@ -1,0 +1,329 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Short-lived AWS PrivateLink forward-proxy provider lab. Creates isolated VPC,
+  two Amazon Linux 2023 Squid EC2 targets in separate AZs,
+  one internal multi-AZ NLB, and an manually-approved Endpoint Service.
+Parameters:
+  ConsumerAccountId:
+    Type: String
+    AllowedPattern: '^[0-9]{12}$'
+    Description: AWS account ID allowed to request access to this service (no default; provide at deploy time).
+  ProviderAzId1:
+    Type: String
+    Default: apse2-az1
+    Description: First physical AZ ID (use the same AZ ID in the consumer stack).
+  ProviderAzId2:
+    Type: String
+    Default: apse2-az2
+    Description: Second physical Availability Zone ID, different from ProviderAzId1. Coordinate with B.
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+Resources:
+  ProviderVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.240.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: privatelink-proxy-lab-provider
+        - Key: Lab
+          Value: PrivateLinkProxyLab
+  PublicSubnetAz1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProviderVpc
+      CidrBlock: 10.240.1.0/24
+      AvailabilityZoneId: !Ref ProviderAzId1
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: privatelink-proxy-lab-provider-public-az1
+  PublicSubnetAz2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProviderVpc
+      CidrBlock: 10.240.2.0/24
+      AvailabilityZoneId: !Ref ProviderAzId2
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: privatelink-proxy-lab-provider-public-az2
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: privatelink-proxy-lab-provider-igw
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref ProviderVpc
+      InternetGatewayId: !Ref InternetGateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ProviderVpc
+      Tags:
+        - Key: Name
+          Value: privatelink-proxy-lab-provider-public-rt
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetAz1RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetAz1
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetAz2RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetAz2
+      RouteTableId: !Ref PublicRouteTable
+  NlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal NLB accepts only approved PrivateLink consumer subnet traffic
+      VpcId: !Ref ProviderVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3128
+          ToPort: 3128
+          CidrIp: 10.241.1.0/24
+          Description: PrivateLink traffic from B lab Lambda subnet only
+        - IpProtocol: tcp
+          FromPort: 3128
+          ToPort: 3128
+          CidrIp: 10.241.2.0/24
+          Description: PrivateLink traffic from B lab Lambda subnet AZ2
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 3128
+          ToPort: 3128
+          CidrIp: 10.240.1.0/24
+          Description: TCP proxy traffic and NLB health checks to Squid
+        - IpProtocol: tcp
+          FromPort: 3128
+          ToPort: 3128
+          CidrIp: 10.240.2.0/24
+          Description: Proxy traffic and health checks to Squid AZ2
+      Tags:
+        - Key: Name
+          Value: privatelink-proxy-lab-provider-nlb-sg
+        - Key: Lab
+          Value: PrivateLinkProxyLab
+  ProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Squid accepts only NLB security group on port 3128; no SSH
+      VpcId: !Ref ProviderVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3128
+          ToPort: 3128
+          SourceSecurityGroupId: !Ref NlbSecurityGroup
+          Description: From the NLB security group only
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Proxy may establish HTTPS to approved external destinations
+      Tags:
+        - Key: Name
+          Value: privatelink-proxy-lab-provider-squid-sg
+  Ec2SsmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      RoleName: !Sub '${AWS::StackName}-ec2-ssm-role'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-ssm-profile'
+      Roles:
+        - !Ref Ec2SsmRole
+  SquidInstanceAz1:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - DefaultPublicRoute
+      - PublicSubnetAz1RouteAssociation
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref AmiId
+      SubnetId: !Ref PublicSubnetAz1
+      SecurityGroupIds:
+        - !Ref ProxySecurityGroup
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      CreditSpecification:
+        CPUCredits: standard
+      Tags:
+        - Key: Name
+          Value: privatelink-proxy-lab-squid-az1
+        - Key: Lab
+          Value: PrivateLinkProxyLab
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf -y install squid
+          cp /etc/squid/squid.conf /etc/squid/squid.conf.original
+          cat >/etc/squid/squid.conf <<'SQUID_CONFIG'
+          http_port 3128
+          acl SSL_ports port 443
+          acl CONNECT method CONNECT
+          acl allowed_sites dstdomain checkip.amazonaws.com
+          http_access deny !CONNECT
+          http_access deny CONNECT !SSL_ports
+          http_access allow allowed_sites
+          http_access deny all
+          forwarded_for delete
+          via off
+          visible_hostname privatelink-proxy-lab
+          access_log stdio:/var/log/squid/access.log squid
+          SQUID_CONFIG
+          squid -k parse
+          systemctl enable --now squid
+  SquidInstanceAz2:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - DefaultPublicRoute
+      - PublicSubnetAz2RouteAssociation
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref AmiId
+      SubnetId: !Ref PublicSubnetAz2
+      SecurityGroupIds:
+        - !Ref ProxySecurityGroup
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      CreditSpecification:
+        CPUCredits: standard
+      Tags:
+        - Key: Name
+          Value: privatelink-proxy-lab-squid-az2
+        - Key: Lab
+          Value: PrivateLinkProxyLab
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf -y install squid
+          cp /etc/squid/squid.conf /etc/squid/squid.conf.original
+          cat >/etc/squid/squid.conf <<'SQUID_CONFIG'
+          http_port 3128
+          acl SSL_ports port 443
+          acl CONNECT method CONNECT
+          acl allowed_sites dstdomain checkip.amazonaws.com
+          http_access deny !CONNECT
+          http_access deny CONNECT !SSL_ports
+          http_access allow allowed_sites
+          http_access deny all
+          forwarded_for delete
+          via off
+          visible_hostname privatelink-proxy-lab
+          access_log stdio:/var/log/squid/access.log squid
+          SQUID_CONFIG
+          squid -k parse
+          systemctl enable --now squid
+  InternalNlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: privatelink-proxy-lab
+      Scheme: internal
+      Type: network
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnetAz1
+        - !Ref PublicSubnetAz2
+      SecurityGroups:
+        - !Ref NlbSecurityGroup
+      EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic: 'on'
+      Tags:
+        - Key: Name
+          Value: privatelink-proxy-lab
+  ProxyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: privatelink-proxy-lab-tg
+      VpcId: !Ref ProviderVpc
+      TargetType: instance
+      Protocol: TCP
+      Port: 3128
+      HealthCheckEnabled: true
+      HealthCheckProtocol: TCP
+      HealthCheckPort: '3128'
+      Tags:
+        - Key: Name
+          Value: privatelink-proxy-lab-provider-tg
+      Targets:
+        - Id: !Ref SquidInstanceAz1
+          Port: 3128
+        - Id: !Ref SquidInstanceAz2
+          Port: 3128
+  ProxyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InternalNlb
+      Port: 3128
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ProxyTargetGroup
+  EndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    DependsOn: ProxyListener
+    Properties:
+      AcceptanceRequired: true
+      Tags:
+        - Key: Name
+          Value: privatelink-proxy-lab-provider-endpoint-service
+        - Key: Lab
+          Value: PrivateLinkProxyLab
+      NetworkLoadBalancerArns:
+        - !Ref InternalNlb
+  EndpointServicePermission:
+    Type: AWS::EC2::VPCEndpointServicePermissions
+    Properties:
+      ServiceId: !Ref EndpointService
+      AllowedPrincipals:
+        - !Sub 'arn:aws:iam::${ConsumerAccountId}:root'
+Outputs:
+  ServiceName:
+    Description: Supply this exact string as ServiceName when deploying consumer stack.
+    Value: !Sub 'com.amazonaws.vpce.${AWS::Region}.${EndpointService}'
+  ServiceId:
+    Value: !Ref EndpointService
+  ProviderAzId1:
+    Value: !GetAtt PublicSubnetAz1.AvailabilityZoneId
+  ProxyPublicIpAz1:
+    Description: One of two possible public egress IPs returned by checkip.amazonaws.com
+    Value: !GetAtt SquidInstanceAz1.PublicIp
+  SquidInstanceIdAz1:
+    Description: Squid EC2 AZ1 instance ID.
+    Value: !Ref SquidInstanceAz1
+  ProviderAzId2:
+    Value: !GetAtt PublicSubnetAz2.AvailabilityZoneId
+  ProxyPublicIpAz2:
+    Description: Second possible public egress IP returned by checkip.amazonaws.com.
+    Value: !GetAtt SquidInstanceAz2.PublicIp
+  SquidInstanceIdAz2:
+    Description: Squid EC2 AZ2 instance ID.
+    Value: !Ref SquidInstanceAz2
