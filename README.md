@@ -73,7 +73,7 @@ flowchart LR
 - Squid EC2 SG は NLB SG からの TCP/3128 だけを受信し、SSH（TCP/22）を開放しません。
 - Squid は **`checkip.amazonaws.com` へのHTTPS CONNECT（443）** のみ許可する検証用設定です。公開プロキシとして外部サイトへ無制限に転送する設定ではありません。
 - Endpoint Service は `ConsumerAccountId` で許可した AWS アカウントだけに接続権限を付け、**接続承認は手動**です。
-- EC2にはパブリックIPv4が割り当てられ、Internet Gateway を経由して外部へ通信します。**Elastic IPは使用しません**。EC2を停止・再起動すると送信元IPが変わり得ます。固定送信元IPが必須の用途にはそのまま使えません。
+- EC2にはパブリックIPv4が割り当てられ、Internet Gateway を経由して外部へ通信します。**Elastic IPは使用しません**。EC2を停止してから起動すると送信元IPが変わり得ます。固定送信元IPが必須の用途にはそのまま使えません。
 - IAM、ネットワーク、監査設定、踏み台不要アクセス（SSM）、Squid 設定はユースケースに合わせて追加レビューしてください。本番向けの可用性設計・監視・自動置換は含まれません。
 
 ## 公開リポジトリでの取り扱い
