@@ -1,0 +1,17 @@
+{
+  "cloudwatch.emitMetrics": false,
+  "checkpointFile": "/var/lib/aws-kinesis-agent/checkpoints",
+  "firehose.endpoint": "https://firehose.ap-southeast-2.amazonaws.com",
+  "flows": [
+    {
+      "filePattern": "/var/log/squid/access.log*",
+      "deliveryStream": "YOUR_STREAM_NAME",
+      "initialPosition": "START_OF_FILE",
+      "aggregatedRecordSizeBytes": 5120,
+      "maxBufferAgeMillis": 60000,
+      "maxBufferSizeBytes": 4194304,
+      "maxBufferSizeRecords": 500,
+      "minTimeBetweenFilePollsMillis": 100
+    }
+  ]
+}

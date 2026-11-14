@@ -1,0 +1,131 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Recovery only: finish PrivateLink using existing VPC, NLB, EC2. Creates no EC2 and removes nothing.",
+  "Parameters": {
+    "ProviderVpc": {
+      "Type": "String"
+    },
+    "InternalNlb": {
+      "Type": "String"
+    },
+    "SquidInstanceAz1": {
+      "Type": "String"
+    },
+    "SquidInstanceAz2": {
+      "Type": "String"
+    },
+    "ConsumerAccountId": {
+      "Type": "String"
+    }
+  },
+  "Resources": {
+    "ProxyTargetGroup": {
+      "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-tg"
+        },
+        "VpcId": {
+          "Ref": "ProviderVpc"
+        },
+        "TargetType": "instance",
+        "Protocol": "TCP",
+        "Port": 3128,
+        "HealthCheckEnabled": true,
+        "HealthCheckProtocol": "TCP",
+        "HealthCheckPort": "3128",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-provider-tg"
+          }
+        ],
+        "Targets": [
+          {
+            "Id": {
+              "Ref": "SquidInstanceAz1"
+            },
+            "Port": 3128
+          },
+          {
+            "Id": {
+              "Ref": "SquidInstanceAz2"
+            },
+            "Port": 3128
+          }
+        ]
+      }
+    },
+    "ProxyListener": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Properties": {
+        "LoadBalancerArn": {
+          "Ref": "InternalNlb"
+        },
+        "Port": 3128,
+        "Protocol": "TCP",
+        "DefaultActions": [
+          {
+            "Type": "forward",
+            "TargetGroupArn": {
+              "Ref": "ProxyTargetGroup"
+            }
+          }
+        ]
+      }
+    },
+    "EndpointService": {
+      "Type": "AWS::EC2::VPCEndpointService",
+      "DependsOn": "ProxyListener",
+      "Properties": {
+        "AcceptanceRequired": true,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-provider-endpoint-service"
+          },
+          {
+            "Key": "Lab",
+            "Value": "PrivateLinkProxyLab"
+          }
+        ],
+        "NetworkLoadBalancerArns": [
+          {
+            "Ref": "InternalNlb"
+          }
+        ]
+      }
+    },
+    "EndpointServicePermission": {
+      "Type": "AWS::EC2::VPCEndpointServicePermissions",
+      "Properties": {
+        "ServiceId": {
+          "Ref": "EndpointService"
+        },
+        "AllowedPrincipals": [
+          {
+            "Fn::Sub": "arn:aws:iam::${ConsumerAccountId}:root"
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "ServiceName": {
+      "Description": "Supply this exact string as ServiceName when deploying consumer stack.",
+      "Value": {
+        "Fn::Sub": "com.amazonaws.vpce.${AWS::Region}.${EndpointService}"
+      }
+    },
+    "ServiceId": {
+      "Value": {
+        "Ref": "EndpointService"
+      }
+    },
+    "TargetGroupArn": {
+      "Value": {
+        "Ref": "ProxyTargetGroup"
+      }
+    }
+  }
+}
