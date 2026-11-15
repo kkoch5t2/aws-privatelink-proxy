@@ -42,11 +42,38 @@ Agentのポーリング100ms、送信バッファの時間上限60秒は共通�
 AL2023上のSquid 6.13、Kinesis Agent 2.0.14、Corretto 17で検証しました。
 初回のサービス登録失敗は、同じEC2上でネイティブsystemd unitへ修正しました。
 EC2の置換を避けるため、未作成の接続用リソースは補完スタックで作成しています。
-元のAスタックはCREATE_FAILEDの状態で保持され、実行環境は補完構成で稼働中です。
+元のAスタックはCREATE_FAILEDの状態で保持し、初回環境は補完構成を使用しました。検証後はEC2を停止しています。
 
 修正版テンプレートはAWSのvalidate-templateとシェル・Python構文を検査し、導入・設定・起動・収集を現在のEC2で確認しています。
-修正版から全環境を新規作成する追加のクリーン構築検証は行っていません。
+初回時点では未実施だった修正版からの新規構築は、追加検証で確認しました。結果は次節に記録しています。
 既存2AZテンプレートの本体は変更していません。
 
 実アカウントID、IP、ログ原本、API応答、画面、照合記録は非公開の証跡に保存し、この公開リポジトリには含めていません。
 全環境・全ログは明示的な削除指示まで保持しています。自動削除は設定していません。
+
+## 修正版テンプレートの新規構築確認（2026-11-15 JST）
+
+配布テンプレートのGitリビジョン `7bfad4c` の3ファイルを変更せず、初回環境とは別名のスタックで新規作成しました。
+00→01→02の順に作成し、B側Endpointの接続要求をA側で承認しています。
+既存リソースの流用、SSMによる設定修正、`01b-existing-provider-link.json`による補完は行っていません。
+
+| スタック | 内容 | 結果 |
+|---|---|---|
+| `squidfresh-store`（A） | S3・Firehose | `CREATE_COMPLETE` |
+| `squidfresh-a`（A） | VPC・2AZ EC2・NLB・Endpoint Serviceなど | `CREATE_COMPLETE` |
+| `squidfresh-b`（B） | VPC・2AZ Endpoint・Lambdaなど | `CREATE_COMPLETE` |
+
+2台のEC2はUserDataの処理だけで初期設定を完了し、CloudFormationがSUCCESSシグナルを受信しました。
+読み取りによる確認では、cloud-initはdone、Squid・Kinesis Agentはともにactive・enabled、
+Kinesis Agentはネイティブsystemd unitを使用し、NRestarts=0・ExecMainStatus=0でした。
+
+B側Lambdaから各AZへ3回ずつ、計6回の実通信を行い、すべてHTTP 200で成功しました。
+EC2原本とS3原本はともに6行・1,134 B、S3ログオブジェクトは1個でした。
+欠損0・余分な行0、全行LF、6件のリクエストIDはすべて1回ずつ到着しました。
+
+これは修正版からの新規構築を確認するための追加検証です。
+初回の802行・集約6条件・ローテーション等の結果とは分けて記録しています。
+テンプレートのSHA-256、全スタックの状態とイベント、SSM応答、Lambda応答、EC2/S3原本、
+照合結果と画面キャプチャは`private-evidence/clean-20261115/`に保持しています。
+検証後は新規EC2も停止し、初回分を含む4台すべてがstoppedであることを確認しました。
+リソース・ログは削除していません。NLB・Endpoint・EBS等の課金は継続します。

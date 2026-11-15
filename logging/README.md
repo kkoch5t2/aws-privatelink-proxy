@@ -184,8 +184,34 @@ AL2023リポジトリのAgent 2.0.14のRPMにはSysV形式の起動スクリプ�
 
 配布する `01-provider-logging.json` のUserDataには、ネイティブunit、永続チェックポイント、
 Corretto 17、CONNECTログのみの収集を反映しています。
-この修正版テンプレートから全環境をもう一度作り直す確認は行っていません。
-現在のEC2上で導入・設定・起動・実ログ収集を確認した結果と、未実施のクリーン構築確認を区別してください。
+初回検証時点では修正版による新規構築は未実施でしたが、追加検証で環境全体の新規作成と実ログのS3到着まで確認しました。詳細は次節に記録しています。
 未実行の `native-agent-service` 変更セットはEC2置換を含むため、実行しないでください。
 
 通常の新規構築は00→01→02、今回の保持環境を操作するときは補完スタック付きのコマンドを使います。
+
+## 修正版テンプレートの新規構築確認（2026-11-15 JST）
+
+配布テンプレートのGitリビジョン `7bfad4c` の3ファイルを変更せず、初回環境とは別名のスタックで新規作成しました。
+00→01→02の順に作成し、B側Endpointの接続要求をA側で承認しています。
+既存リソースの流用、SSMによる設定修正、`01b-existing-provider-link.json`による補完は行っていません。
+
+| スタック | 内容 | 結果 |
+|---|---|---|
+| `squidfresh-store`（A） | S3・Firehose | `CREATE_COMPLETE` |
+| `squidfresh-a`（A） | VPC・2AZ EC2・NLB・Endpoint Serviceなど | `CREATE_COMPLETE` |
+| `squidfresh-b`（B） | VPC・2AZ Endpoint・Lambdaなど | `CREATE_COMPLETE` |
+
+2台のEC2はUserDataの処理だけで初期設定を完了し、CloudFormationがSUCCESSシグナルを受信しました。
+読み取りによる確認では、cloud-initはdone、Squid・Kinesis Agentはともにactive・enabled、
+Kinesis Agentはネイティブsystemd unitを使用し、NRestarts=0・ExecMainStatus=0でした。
+
+B側Lambdaから各AZへ3回ずつ、計6回の実通信を行い、すべてHTTP 200で成功しました。
+EC2原本とS3原本はともに6行・1,134 B、S3ログオブジェクトは1個でした。
+欠損0・余分な行0、全行LF、6件のリクエストIDはすべて1回ずつ到着しました。
+
+これは修正版からの新規構築を確認するための追加検証です。
+初回の802行・集約6条件・ローテーション等の結果とは分けて記録しています。
+テンプレートのSHA-256、全スタックの状態とイベント、SSM応答、Lambda応答、EC2/S3原本、
+照合結果と画面キャプチャは`private-evidence/clean-20261115/`に保持しています。
+検証後は新規EC2も停止し、初回分を含む4台すべてがstoppedであることを確認しました。
+リソース・ログは削除していません。NLB・Endpoint・EBS等の課金は継続します。
