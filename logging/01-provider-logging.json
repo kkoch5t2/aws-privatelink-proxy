@@ -292,6 +292,13 @@
                   "Action": "firehose:PutRecordBatch",
                   "Resource": {
                     "Fn::Sub": "arn:${AWS::Partition}:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${FirehoseStreamName}"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:SourceVpce": {
+                        "Ref": "FirehoseEndpoint"
+                      }
+                    }
                   }
                 },
                 {
@@ -324,7 +331,8 @@
       "Type": "AWS::EC2::Instance",
       "DependsOn": [
         "DefaultPublicRoute",
-        "PublicSubnetAz1RouteAssociation"
+        "PublicSubnetAz1RouteAssociation",
+        "FirehoseEndpoint"
       ],
       "Properties": {
         "InstanceType": "t3.micro",
@@ -391,7 +399,8 @@
       "Type": "AWS::EC2::Instance",
       "DependsOn": [
         "DefaultPublicRoute",
-        "PublicSubnetAz2RouteAssociation"
+        "PublicSubnetAz2RouteAssociation",
+        "FirehoseEndpoint"
       ],
       "Properties": {
         "InstanceType": "t3.micro",
@@ -631,6 +640,97 @@
           ]
         }
       }
+    },
+    "FirehoseEndpointSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Firehose PrivateLink: HTTPS from Squid EC2 security group only",
+        "VpcId": {
+          "Ref": "ProviderVpc"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "SourceSecurityGroupId": {
+              "Ref": "ProxySecurityGroup"
+            },
+            "Description": "Kinesis Agent HTTPS to Firehose"
+          }
+        ],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "CidrIp": "127.0.0.1/32",
+            "Description": "No initiated outbound connections; response traffic is stateful"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-firehose-endpoint-sg"
+            }
+          }
+        ]
+      }
+    },
+    "FirehoseEndpoint": {
+      "Type": "AWS::EC2::VPCEndpoint",
+      "Properties": {
+        "VpcEndpointType": "Interface",
+        "VpcId": {
+          "Ref": "ProviderVpc"
+        },
+        "ServiceName": {
+          "Fn::Sub": "com.amazonaws.${AWS::Region}.kinesis-firehose"
+        },
+        "PrivateDnsEnabled": true,
+        "SubnetIds": [
+          {
+            "Ref": "PublicSubnetAz1"
+          },
+          {
+            "Ref": "PublicSubnetAz2"
+          }
+        ],
+        "SecurityGroupIds": [
+          {
+            "Ref": "FirehoseEndpointSecurityGroup"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "firehose:PutRecordBatch",
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${FirehoseStreamName}"
+              },
+              "Condition": {
+                "ArnEquals": {
+                  "aws:PrincipalArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-ec2-ssm-role"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-firehose-endpoint"
+            }
+          }
+        ]
+      }
     }
   },
   "Outputs": {
@@ -704,6 +804,17 @@
     "FirehoseStreamName": {
       "Value": {
         "Ref": "FirehoseStreamName"
+      }
+    },
+    "FirehoseEndpointId": {
+      "Value": {
+        "Ref": "FirehoseEndpoint"
+      },
+      "Description": "Firehose private interface endpoint in both provider AZs; private DNS enabled."
+    },
+    "FirehoseEndpointSecurityGroupId": {
+      "Value": {
+        "Ref": "FirehoseEndpointSecurityGroup"
       }
     }
   }

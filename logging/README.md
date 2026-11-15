@@ -8,19 +8,38 @@
 | 順序 | テンプレート | アカウント | 内容 |
 |---|---|---|---|
 | 1 | `00-log-storage.json` | A | S3、配信用IAMロール、共通のDirect PUT Firehose 1本 |
-| 2 | `01-provider-logging.json` | A | 既存のVPC・内部NLB・Squid EC2×2・Endpoint ServiceにAgent設定を追加 |
+| 2 | `01-provider-logging.json` | A | VPC・内部NLB・Squid EC2×2・Endpoint Service、2AZのFirehose用Endpoint、Kinesis Agent設定 |
 | 3 | `02-consumer-logging.json` | B | 外部直接経路のないVPC、2AZ Interface Endpoint、有限のHTTPSリクエストを生成するLambda |
 | 4 | AでEndpoint接続要求を承認 | A | BのEndpoint IDを照合して承認 |
 
 A/Bは別アカウント、リージョンは `ap-southeast-2`。物理AZ IDは両側で一致させます。
-ログ経路は各EC2の公開IPv4 → IGW → Firehoseの公開HTTPS API → S3です。
-Firehose用Interface Endpoint、NAT Gateway、Kinesis Data Streams、変換Lambda、動的パーティショニングは作成しません。
+ログ経路は各EC2のKinesis Agent → A側Firehose用Interface Endpoint → Firehose → S3です。
+Firehose用Endpointは2AZにENIを作成し、Private DNSを有効にします。通常のFirehoseサービスURLはEndpointのプライベートIPへ解決されます。
+Squidから外部サイトへの通信には公開IPv4とIGWを使います。NAT Gateway、Kinesis Data Streams、変換Lambda、動的パーティショニングは作成しません。
+B側のプロキシ用Endpoint（3128）と、A側のFirehose用Endpoint（443）は別のリソースです。
+
+## Firehose用Endpointの確認
+
+`01-provider-logging.json`の出力`FirehoseEndpointId`がA側のログ送信用Endpointです。
+`02-consumer-logging.json`の`ConsumerEndpointId`はB側のプロキシ接続用で、用途が異なります。
+Firehose用Endpointの状態が`available`、`PrivateDnsEnabled=true`、ENIが2AZにあることを確認します。
+EC2内で次を実行し、解決先がFirehose用Endpoint ENIのプライベートIPと一致することを確認します。
+
+```bash
+# EC2からFirehoseの通常のサービス名を解決する
+getent ahostsv4 firehose.ap-southeast-2.amazonaws.com
+```
+
+通常のサービス名を使う場合、常に同一AZのENIが選ばれる保証はありません。
+VPC内DNSサポートとDNSホスト名はテンプレートで有効にしています。
 
 ## 導入と認証
 
 EC2 UserDataがAL2023の公式リポジトリから Corretto 17と `dnf -y install squid aws-kinesis-agent jq` を実行し、
 Squid設定・Agent設定・ログの読み取り権限・起動まで自動化します。
-EC2はIMDSv2必須。アクセスキーは書かず、インスタンスロールに対象ストリームの `firehose:PutRecordBatch` のみを追加します。
+EC2はIMDSv2必須。アクセスキーは書かず、インスタンスロールに対象ストリームの `firehose:PutRecordBatch` を追加し、`aws:SourceVpce` で今回のFirehose用Endpoint経由に限定します。
+Endpointポリシーも同じロール・ストリーム・操作だけを許可し、Endpoint SGはSquid EC2 SGからのTCP 443だけを受け付けます。
+ポリシーがこの状態なら、公開APIへ名前解決された場合には送信権限が成立しません。
 管理用の既存SSM権限と、UserData成功通知用の `cloudformation:SignalResource` も使います。
 SSHは開放せず、SquidはNLB SGからの3128番ポートだけ受け付けます。
 Squidの接続先許可は `checkip.amazonaws.com:443` のCONNECTだけです。
@@ -136,13 +155,15 @@ SSM Documentもテンプレート内に作成します。AWS Systems ManagerのR
 | EC2 Linux t3.micro | $0.0132 ×2 | $0.0264 |
 | 内部NLB | $0.0252 ×1 | $0.0252＋使用NLCU分 |
 | B側Interface Endpoint | $0.013/AZ ×2 | $0.026 |
+| A側Firehose用Interface Endpoint | $0.013/AZ ×2 | $0.026 |
 | A側パブリックIPv4 | $0.005 ×2 | $0.010 |
 | EBS gp3 | $0.096/GB月 ×16GB | 約$0.0021（730時間換算） |
-| 固定部分の合計 | 上記の合計 | 約$0.0897/時、約$2.15/日 |
+| 固定部分の合計 | 上記の合計 | 約$0.1157/時、約$2.78/日 |
 
 このほかFirehose Direct PUT、S3保存・リクエスト、Lambda、CloudWatch Logs、
 データ処理・転送などが従量で発生します。Agent自体のライセンス料金はありません。
-Agent独自のCloudWatchメトリクス、カスタムダッシュボード、アラーム、追加Interface Endpointは使いません。
+Kinesis Agent独自のCloudWatchメトリクス、カスタムダッシュボード、アラームは使いません。
+Firehose用Endpointには上記の固定料金に加えてデータ処理料金が発生します。
 標準メトリクスの取得APIにも条件によって料金がかかるため、必要な区間だけ取得します。
 
 Firehose課金対象量は各入力レコードの実サイズを5120B単位で切り上げて合計します。
@@ -169,7 +190,38 @@ API応答のJSON・スクリプト出力と、実際の設定画面キャプチ�
 初回検証・追加検証・推測・構成の再現図を区別して記載します。
 新記事は下書きに留め、確認後の公開指示を待ちます。
 
-## 今回の初回構築で使った補完構成
+## Firehose用Interface Endpoint経由での再検証（2026-11-15 JST）
+
+配布する3テンプレートから、`squidvpce-store`・`squidvpce-a`・`squidvpce-b`を新規作成しました。
+3スタックとも`CREATE_COMPLETE`。デプロイ済みテンプレートと配布ファイルの一致も確認しています。
+UserDataの設定修正や補完スタックは使わず、2台ともSquid・Kinesis Agentがactive・enabledになりました。
+Endpointの接続承認、集約モード変更、ローテーションなど、通常の操作・検証はSSM/APIで行います。
+
+Firehose用Endpointは2AZ・Private DNS有効。両EC2の通常のFirehoseサービス名の解決先は、Endpoint ENIのプライベートIPと一致しました。
+Endpoint SGはSquid EC2 SGからのTCP 443のみ、Endpointポリシーは該当ロール・ストリームのPutRecordBatchのみです。
+EC2ロールの送信権限は`aws:SourceVpce`で限定しています。配布した送信ポリシー単体のIAMシミュレーションでは、Endpoint条件ありでallowed、なしでimplicitDenyでした。
+このシミュレーションと別に、実際のKinesis Agent送信成功記録・S3原本も照合しています。
+
+最初の疎通は各AZ3件、計6件すべてHTTP 200。EC2/S3は6行・1,137 Bで一致しました。
+集約比較6条件は各120アクセス、継続収集はローテーション・正常再起動・一時送信失敗の3条件を各20アクセスで確認しました。
+最終的にEC2/S3は**786行・146,012 B**で一致し、欠損0・余分な行0、成功ID786件すべてが1回ずつ到着しました。
+S3ログオブジェクトは10個。AZ別の行数は{"az1": 393, "az2": 393}です。
+
+| 条件 | 集約B | IncomingRecords | IncomingBytes | 計算上の課金対象B |
+|---|---:|---:|---:|---:|
+| 通常追記 | 0 | 120 | 22,240 | 614,400 |
+| 通常追記 | 5,120 | 120 | 22,240 | 614,400 |
+| 通常追記 | 51,200 | 120 | 22,240 | 614,400 |
+| 蓄積後 | 0 | 120 | 22,180 | 614,400 |
+| 蓄積後 | 5,120 | 6 | 22,240 | 30,720 |
+| 蓄積後 | 51,200 | 2 | 22,300 | 30,720 |
+
+全条件で原本のバイト数、Kinesis Agentの送信成功レコード数・バイト数、CloudWatch Sumを照合しています。
+課金対象量は各レコードを5,120 B単位で切り上げた計算値で、請求実測ではありません。
+テンプレート・API応答・実行記録・EC2/S3原本・照合結果は`private-evidence/vpce-20261115/`に保存しています。
+検証後、今回作成したEC2 2台は停止しました。スタック・NLB・Endpoint・S3・ログは保持しています。既存環境は変更していません。
+
+## 過去の初回構築で使った補完構成（Endpoint追加前）
 
 AL2023リポジトリのAgent 2.0.14のRPMにはSysV形式の起動スクリプトが含まれていました。
 初回のUserDataがサービス有効化で失敗したため、`squidlog-a` は `CREATE_FAILED` の状態で保持しています。
@@ -189,7 +241,7 @@ Corretto 17、CONNECTログのみの収集を反映しています。
 
 通常の新規構築は00→01→02、今回の保持環境を操作するときは補完スタック付きのコマンドを使います。
 
-## 修正版テンプレートの新規構築確認（2026-11-15 JST）
+## 過去の修正版テンプレート確認（Endpoint追加前、2026-11-15 JST）
 
 配布テンプレートのGitリビジョン `7bfad4c` の3ファイルを変更せず、初回環境とは別名のスタックで新規作成しました。
 00→01→02の順に作成し、B側Endpointの接続要求をA側で承認しています。
