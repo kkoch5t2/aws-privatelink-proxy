@@ -214,4 +214,4 @@ EC2原本とS3原本はともに6行・1,134 B、S3ログオブジェクトは1�
 テンプレートのSHA-256、全スタックの状態とイベント、SSM応答、Lambda応答、EC2/S3原本、
 照合結果と画面キャプチャは`private-evidence/clean-20261115/`に保持しています。
 検証後は新規EC2も停止し、初回分を含む4台すべてがstoppedであることを確認しました。
-リソース・ログは削除していません。NLB・Endpoint・EBS等の課金は継続します。
+その後、ユーザーの明示指示に基づき、新規構築確認用の`squidfresh-store`・`squidfresh-a`・`squidfresh-b`と、保持設定で残ったS3バケット・CloudWatchログを削除しました。削除前にS3全1バージョン（1,134 B）とLambdaログ7イベントを保存し、原本とのSHA-256一致を再確認しています。3スタックの`DELETE_COMPLETE`、新規のVPC・NLB・Endpoint・EC2・EBS・Firehose・S3・CloudWatchログの不在をAPIで確認しました。初回環境はEC2停止状態で保持し、初回環境に残るNLB・Endpoint・EBS等の課金は継続します。削除確認は`private-evidence/clean-20261115/cleanup/deletion-verification.json`に保存しています。
