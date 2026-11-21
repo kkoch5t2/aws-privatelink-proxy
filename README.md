@@ -1,5 +1,7 @@
 # AWS PrivateLink × Squid — 2AZ プロキシ検証環境
 
+ログ収集を追加する拡張版は、[logging/README.md](./logging/README.md)を参照してください。既存テンプレートを残し、Kinesis Agent・Firehose・S3の構築と少量検証を追加しています。ログ収集の環境・証跡は、明示的な削除指示まで保持します。
+
 2つの AWS アカウント間で **AWS PrivateLink** を使い、インターネットへの直接経路を持たない Lambda から、別アカウントの Squid プロキシ経由で HTTPS 通信するための CloudFormation サンプルです。
 
 - **B（利用側）**: プライベートサブネット × 2、Interface VPC Endpoint × 1（ENI × 2）、Lambda × 1
@@ -85,6 +87,8 @@ flowchart LR
 このリポジトリは **新規作成用** です。実行済みテンプレートからの差分反映や既存システムへの適用は、Change Set を必ず確認してください。
 
 ## 課金と削除
+
+この節は元の2AZプロキシ検証テンプレートが対象です。ログ収集拡張の保持・削除方針は[logging/README.md](./logging/README.md#上限費用保持)を参照してください。
 
 EC2×2（EBS・パブリックIPv4を含む）、NLB、Interface Endpoint のAZごとのENIなどに継続料金が発生する可能性があります。予算アラートは別途設定してください。自動削除（Guardian）テンプレートは同梱していません。
 

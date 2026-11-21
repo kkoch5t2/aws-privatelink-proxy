@@ -1,0 +1,821 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Extended 2-AZ PrivateLink Squid provider with Amazon Kinesis Agent (AL2023 repository package). Original template unchanged.",
+  "Parameters": {
+    "ConsumerAccountId": {
+      "Type": "String",
+      "AllowedPattern": "^[0-9]{12}$",
+      "Description": "AWS account ID allowed to request access to this service (no default; provide at deploy time)."
+    },
+    "ProviderAzId1": {
+      "Type": "String",
+      "Default": "apse2-az1",
+      "Description": "First physical AZ ID (use the same AZ ID in the consumer stack)."
+    },
+    "ProviderAzId2": {
+      "Type": "String",
+      "Default": "apse2-az2",
+      "Description": "Second physical Availability Zone ID, different from ProviderAzId1. Coordinate with B."
+    },
+    "AmiId": {
+      "Type": "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>",
+      "Default": "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+    },
+    "FirehoseStreamName": {
+      "Type": "String",
+      "AllowedPattern": "[a-zA-Z0-9_.-]{1,64}",
+      "Description": "Output from the log-storage stack in this same account and region."
+    },
+    "AggregatedRecordSizeBytes": {
+      "Type": "Number",
+      "Default": 0,
+      "AllowedValues": [
+        0,
+        5120,
+        51200
+      ]
+    },
+    "AgentMaxBufferAgeMillis": {
+      "Type": "Number",
+      "Default": 60000,
+      "MinValue": 1000,
+      "MaxValue": 900000
+    },
+    "AgentPollMillis": {
+      "Type": "Number",
+      "Default": 100,
+      "MinValue": 100,
+      "MaxValue": 10000
+    }
+  },
+  "Resources": {
+    "ProviderVpc": {
+      "Type": "AWS::EC2::VPC",
+      "Properties": {
+        "CidrBlock": "10.240.0.0/16",
+        "EnableDnsSupport": true,
+        "EnableDnsHostnames": true,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-provider"
+          },
+          {
+            "Key": "Lab",
+            "Value": "PrivateLinkProxyLab"
+          }
+        ]
+      }
+    },
+    "PublicSubnetAz1": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "VpcId": {
+          "Ref": "ProviderVpc"
+        },
+        "CidrBlock": "10.240.1.0/24",
+        "AvailabilityZoneId": {
+          "Ref": "ProviderAzId1"
+        },
+        "MapPublicIpOnLaunch": true,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-provider-public-az1"
+          }
+        ]
+      }
+    },
+    "PublicSubnetAz2": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "VpcId": {
+          "Ref": "ProviderVpc"
+        },
+        "CidrBlock": "10.240.2.0/24",
+        "AvailabilityZoneId": {
+          "Ref": "ProviderAzId2"
+        },
+        "MapPublicIpOnLaunch": true,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-provider-public-az2"
+          }
+        ]
+      }
+    },
+    "InternetGateway": {
+      "Type": "AWS::EC2::InternetGateway",
+      "Properties": {
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-provider-igw"
+          }
+        ]
+      }
+    },
+    "InternetGatewayAttachment": {
+      "Type": "AWS::EC2::VPCGatewayAttachment",
+      "Properties": {
+        "VpcId": {
+          "Ref": "ProviderVpc"
+        },
+        "InternetGatewayId": {
+          "Ref": "InternetGateway"
+        }
+      }
+    },
+    "PublicRouteTable": {
+      "Type": "AWS::EC2::RouteTable",
+      "Properties": {
+        "VpcId": {
+          "Ref": "ProviderVpc"
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-provider-public-rt"
+          }
+        ]
+      }
+    },
+    "DefaultPublicRoute": {
+      "Type": "AWS::EC2::Route",
+      "DependsOn": "InternetGatewayAttachment",
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "PublicRouteTable"
+        },
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "GatewayId": {
+          "Ref": "InternetGateway"
+        }
+      }
+    },
+    "PublicSubnetAz1RouteAssociation": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PublicSubnetAz1"
+        },
+        "RouteTableId": {
+          "Ref": "PublicRouteTable"
+        }
+      }
+    },
+    "PublicSubnetAz2RouteAssociation": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PublicSubnetAz2"
+        },
+        "RouteTableId": {
+          "Ref": "PublicRouteTable"
+        }
+      }
+    },
+    "NlbSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Internal NLB accepts only approved PrivateLink consumer subnet traffic",
+        "VpcId": {
+          "Ref": "ProviderVpc"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 3128,
+            "ToPort": 3128,
+            "CidrIp": "10.241.1.0/24",
+            "Description": "PrivateLink traffic from B lab Lambda subnet only"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 3128,
+            "ToPort": 3128,
+            "CidrIp": "10.241.2.0/24",
+            "Description": "PrivateLink traffic from B lab Lambda subnet AZ2"
+          }
+        ],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 3128,
+            "ToPort": 3128,
+            "CidrIp": "10.240.1.0/24",
+            "Description": "TCP proxy traffic and NLB health checks to Squid"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 3128,
+            "ToPort": 3128,
+            "CidrIp": "10.240.2.0/24",
+            "Description": "Proxy traffic and health checks to Squid AZ2"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-provider-nlb-sg"
+          },
+          {
+            "Key": "Lab",
+            "Value": "PrivateLinkProxyLab"
+          }
+        ]
+      }
+    },
+    "ProxySecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Squid accepts only NLB security group on port 3128; no SSH",
+        "VpcId": {
+          "Ref": "ProviderVpc"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 3128,
+            "ToPort": 3128,
+            "SourceSecurityGroupId": {
+              "Ref": "NlbSecurityGroup"
+            },
+            "Description": "From the NLB security group only"
+          }
+        ],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": -1,
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Proxy may establish HTTPS to approved external destinations"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-provider-squid-sg"
+          }
+        ]
+      }
+    },
+    "Ec2SsmRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "RoleName": {
+          "Fn::Sub": "${AWS::StackName}-ec2-ssm-role"
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "SendSquidLogs",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "firehose:PutRecordBatch",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${FirehoseStreamName}"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:SourceVpce": {
+                        "Ref": "FirehoseEndpoint"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "cloudformation:SignalResource",
+                  "Resource": {
+                    "Ref": "AWS::StackId"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "Ec2InstanceProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "InstanceProfileName": {
+          "Fn::Sub": "${AWS::StackName}-ssm-profile"
+        },
+        "Roles": [
+          {
+            "Ref": "Ec2SsmRole"
+          }
+        ]
+      }
+    },
+    "SquidInstanceAz1": {
+      "Type": "AWS::EC2::Instance",
+      "DependsOn": [
+        "DefaultPublicRoute",
+        "PublicSubnetAz1RouteAssociation",
+        "FirehoseEndpoint"
+      ],
+      "Properties": {
+        "InstanceType": "t3.micro",
+        "ImageId": {
+          "Ref": "AmiId"
+        },
+        "SubnetId": {
+          "Ref": "PublicSubnetAz1"
+        },
+        "SecurityGroupIds": [
+          {
+            "Ref": "ProxySecurityGroup"
+          }
+        ],
+        "IamInstanceProfile": {
+          "Ref": "Ec2InstanceProfile"
+        },
+        "MetadataOptions": {
+          "HttpTokens": "required",
+          "HttpEndpoint": "enabled"
+        },
+        "CreditSpecification": {
+          "CPUCredits": "standard"
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-squid-az1"
+          },
+          {
+            "Key": "Lab",
+            "Value": "PrivateLinkProxyLab"
+          },
+          {
+            "Key": "LoggingLab",
+            "Value": "SquidAgentLab"
+          }
+        ],
+        "UserData": {
+          "Fn::Base64": {
+            "Fn::Sub": "#!/bin/bash\nset -euo pipefail\nexec > >(tee -a /var/log/squid-agent-bootstrap.log) 2>&1\nsignal_exit() { code=$?; trap - EXIT; aws cloudformation signal-resource --stack-name '${AWS::StackId}' --logical-resource-id 'SquidInstanceAz1' --unique-id \"$INSTANCE_ID\" --status \"$(if [ \"$code\" = 0 ]; then echo SUCCESS; else echo FAILURE; fi)\" --region '${AWS::Region}' || true; exit \"$code\"; }\nTOKEN=$(curl -fsS --retry 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://169.254.169.254/latest/api/token)\nINSTANCE_ID=$(curl -fsS -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/instance-id)\ntrap signal_exit EXIT\n# Install the AL2023 repository package, rather than an AL2 RPM.\ndnf -y install java-17-amazon-corretto-headless\ndnf -y install squid aws-kinesis-agent jq\nsystemctl stop aws-kinesis-agent || true\ncp /etc/squid/squid.conf /etc/squid/squid.conf.original\ncat >/etc/squid/squid.conf <<SQUID\nhttp_port 3128\nacl SSL_ports port 443\nacl CONNECT method CONNECT\nacl allowed_sites dstdomain checkip.amazonaws.com\nhttp_access deny !CONNECT\nhttp_access deny CONNECT !SSL_ports\nhttp_access allow allowed_sites\nhttp_access deny all\nforwarded_for delete\nvia off\nvisible_hostname squid-agent-lab-az1\nlogfile_rotate 0\nlogformat agentlab %ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %un %Sh/%<a %mt source=az1 instance=$INSTANCE_ID request=%{X-Lab-Request}>h\naccess_log stdio:/var/log/squid/access.log agentlab CONNECT\nSQUID\n# Group access applies to newly created rotated files as well.\nusermod -a -G squid aws-kinesis-agent-user\ninstall -d -m 0750 -o squid -g squid /var/log/squid\ntouch /var/log/squid/access.log\nchown squid:squid /var/log/squid/access.log\nchmod 0640 /var/log/squid/access.log\ncat >/etc/logrotate.d/squid <<'ROTATE'\n/var/log/squid/access.log {\n  daily\n  missingok\n  notifempty\n  rotate -1\n  nocompress\n  dateext\n  dateformat -%Y%m%d%H%M%S\n  create 0640 squid squid\n  sharedscripts\n  postrotate\n    /usr/sbin/squid -k rotate\n  endscript\n}\nROTATE\ncat >/etc/aws-kinesis/agent.json <<'AGENT'\n{\n  \"cloudwatch.emitMetrics\": false,\n  \"checkpointFile\": \"/var/lib/aws-kinesis-agent/checkpoints\",\n  \"firehose.endpoint\": \"https://firehose.${AWS::Region}.amazonaws.com\",\n  \"flows\": [{\n    \"filePattern\": \"/var/log/squid/access.log*\",\n    \"deliveryStream\": \"${FirehoseStreamName}\",\n    \"initialPosition\": \"START_OF_FILE\",\n    \"aggregatedRecordSizeBytes\": ${AggregatedRecordSizeBytes},\n    \"maxBufferAgeMillis\": ${AgentMaxBufferAgeMillis},\n    \"maxBufferSizeBytes\": 4194304,\n    \"maxBufferSizeRecords\": 500,\n    \"minTimeBetweenFilePollsMillis\": ${AgentPollMillis}\n  }]\n}\nAGENT\nchmod 0644 /etc/aws-kinesis/agent.json\nJAVA17=$(rpm -ql java-17-amazon-corretto-headless | awk '/\\/bin\\/java$/ {print;exit}')\ntest -x \"$JAVA17\"\n# AL2023 package ships a SysV wrapper; use an explicit native systemd unit.\ncat >/etc/systemd/system/aws-kinesis-agent.service <<UNIT\n[Unit]\nDescription=Amazon Kinesis Agent for Squid logs\nWants=network-online.target\nAfter=network-online.target squid.service\n[Service]\nType=simple\nUser=aws-kinesis-agent-user\nSupplementaryGroups=squid\nStateDirectory=aws-kinesis-agent\nWorkingDirectory=/var/lib/aws-kinesis-agent\nEnvironment=\"JAVACMD=$JAVA17\"\nEnvironment=\"JVM_ARGS=-Dlog4j.configurationFile=file:///etc/aws-kinesis/log4j.xml\"\nExecStart=/usr/bin/start-aws-kinesis-agent -c /etc/aws-kinesis/agent.json\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=90\nUMask=0027\n[Install]\nWantedBy=multi-user.target\nUNIT\nprintf '# Managed by native systemd service; legacy babysitter disabled.\\n' >/etc/cron.d/aws-kinesis-agent\nmkdir -p /etc/systemd/system/aws-kinesis-agent.service.d\ncat >/etc/systemd/system/aws-kinesis-agent.service.d/java-memory.conf <<'UNIT'\n[Service]\nEnvironment=\"JAVA_START_HEAP=32m\"\nEnvironment=\"JAVA_MAX_HEAP=128m\"\nUNIT\n# Preserve agent evidence too; no default seven-day log expiration.\ncat >/etc/aws-kinesis/log4j.xml <<'LOG4J'\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Configuration>\n  <Appenders>\n    <File name=\"FILE\" fileName=\"/var/log/aws-kinesis-agent/aws-kinesis-agent.log\">\n      <PatternLayout pattern=\"%d{yyyy-MM-dd HH:mm:ss.SSSZ} (%t) %c [%p] %m%n\" />\n    </File>\n  </Appenders>\n  <Loggers>\n    <Logger name=\"com.amazon.kinesis.streaming.agent.tailing.FirehoseSender\" level=\"debug\" />\n    <Root level=\"info\"><AppenderRef ref=\"FILE\" /></Root>\n  </Loggers>\n</Configuration>\nLOG4J\nsystemctl daemon-reload\nsquid -k parse\nsystemctl enable --now squid\nsystemctl enable --now aws-kinesis-agent\nsystemctl is-active --quiet squid\nsystemctl is-active --quiet aws-kinesis-agent\nrpm -q squid aws-kinesis-agent > /var/log/squid-agent-versions.txt\n\"$JAVA17\" -version >> /var/log/squid-agent-versions.txt 2>&1\nsleep 5\nsystemctl is-active --quiet aws-kinesis-agent\n"
+          }
+        },
+        "BlockDeviceMappings": [
+          {
+            "DeviceName": "/dev/xvda",
+            "Ebs": {
+              "VolumeSize": 8,
+              "VolumeType": "gp3",
+              "Encrypted": true,
+              "DeleteOnTermination": true
+            }
+          }
+        ]
+      },
+      "CreationPolicy": {
+        "ResourceSignal": {
+          "Count": 1,
+          "Timeout": "PT15M"
+        }
+      }
+    },
+    "SquidInstanceAz2": {
+      "Type": "AWS::EC2::Instance",
+      "DependsOn": [
+        "DefaultPublicRoute",
+        "PublicSubnetAz2RouteAssociation",
+        "FirehoseEndpoint"
+      ],
+      "Properties": {
+        "InstanceType": "t3.micro",
+        "ImageId": {
+          "Ref": "AmiId"
+        },
+        "SubnetId": {
+          "Ref": "PublicSubnetAz2"
+        },
+        "SecurityGroupIds": [
+          {
+            "Ref": "ProxySecurityGroup"
+          }
+        ],
+        "IamInstanceProfile": {
+          "Ref": "Ec2InstanceProfile"
+        },
+        "MetadataOptions": {
+          "HttpTokens": "required",
+          "HttpEndpoint": "enabled"
+        },
+        "CreditSpecification": {
+          "CPUCredits": "standard"
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-squid-az2"
+          },
+          {
+            "Key": "Lab",
+            "Value": "PrivateLinkProxyLab"
+          },
+          {
+            "Key": "LoggingLab",
+            "Value": "SquidAgentLab"
+          }
+        ],
+        "UserData": {
+          "Fn::Base64": {
+            "Fn::Sub": "#!/bin/bash\nset -euo pipefail\nexec > >(tee -a /var/log/squid-agent-bootstrap.log) 2>&1\nsignal_exit() { code=$?; trap - EXIT; aws cloudformation signal-resource --stack-name '${AWS::StackId}' --logical-resource-id 'SquidInstanceAz2' --unique-id \"$INSTANCE_ID\" --status \"$(if [ \"$code\" = 0 ]; then echo SUCCESS; else echo FAILURE; fi)\" --region '${AWS::Region}' || true; exit \"$code\"; }\nTOKEN=$(curl -fsS --retry 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://169.254.169.254/latest/api/token)\nINSTANCE_ID=$(curl -fsS -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/instance-id)\ntrap signal_exit EXIT\n# Install the AL2023 repository package, rather than an AL2 RPM.\ndnf -y install java-17-amazon-corretto-headless\ndnf -y install squid aws-kinesis-agent jq\nsystemctl stop aws-kinesis-agent || true\ncp /etc/squid/squid.conf /etc/squid/squid.conf.original\ncat >/etc/squid/squid.conf <<SQUID\nhttp_port 3128\nacl SSL_ports port 443\nacl CONNECT method CONNECT\nacl allowed_sites dstdomain checkip.amazonaws.com\nhttp_access deny !CONNECT\nhttp_access deny CONNECT !SSL_ports\nhttp_access allow allowed_sites\nhttp_access deny all\nforwarded_for delete\nvia off\nvisible_hostname squid-agent-lab-az2\nlogfile_rotate 0\nlogformat agentlab %ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %un %Sh/%<a %mt source=az2 instance=$INSTANCE_ID request=%{X-Lab-Request}>h\naccess_log stdio:/var/log/squid/access.log agentlab CONNECT\nSQUID\n# Group access applies to newly created rotated files as well.\nusermod -a -G squid aws-kinesis-agent-user\ninstall -d -m 0750 -o squid -g squid /var/log/squid\ntouch /var/log/squid/access.log\nchown squid:squid /var/log/squid/access.log\nchmod 0640 /var/log/squid/access.log\ncat >/etc/logrotate.d/squid <<'ROTATE'\n/var/log/squid/access.log {\n  daily\n  missingok\n  notifempty\n  rotate -1\n  nocompress\n  dateext\n  dateformat -%Y%m%d%H%M%S\n  create 0640 squid squid\n  sharedscripts\n  postrotate\n    /usr/sbin/squid -k rotate\n  endscript\n}\nROTATE\ncat >/etc/aws-kinesis/agent.json <<'AGENT'\n{\n  \"cloudwatch.emitMetrics\": false,\n  \"checkpointFile\": \"/var/lib/aws-kinesis-agent/checkpoints\",\n  \"firehose.endpoint\": \"https://firehose.${AWS::Region}.amazonaws.com\",\n  \"flows\": [{\n    \"filePattern\": \"/var/log/squid/access.log*\",\n    \"deliveryStream\": \"${FirehoseStreamName}\",\n    \"initialPosition\": \"START_OF_FILE\",\n    \"aggregatedRecordSizeBytes\": ${AggregatedRecordSizeBytes},\n    \"maxBufferAgeMillis\": ${AgentMaxBufferAgeMillis},\n    \"maxBufferSizeBytes\": 4194304,\n    \"maxBufferSizeRecords\": 500,\n    \"minTimeBetweenFilePollsMillis\": ${AgentPollMillis}\n  }]\n}\nAGENT\nchmod 0644 /etc/aws-kinesis/agent.json\nJAVA17=$(rpm -ql java-17-amazon-corretto-headless | awk '/\\/bin\\/java$/ {print;exit}')\ntest -x \"$JAVA17\"\n# AL2023 package ships a SysV wrapper; use an explicit native systemd unit.\ncat >/etc/systemd/system/aws-kinesis-agent.service <<UNIT\n[Unit]\nDescription=Amazon Kinesis Agent for Squid logs\nWants=network-online.target\nAfter=network-online.target squid.service\n[Service]\nType=simple\nUser=aws-kinesis-agent-user\nSupplementaryGroups=squid\nStateDirectory=aws-kinesis-agent\nWorkingDirectory=/var/lib/aws-kinesis-agent\nEnvironment=\"JAVACMD=$JAVA17\"\nEnvironment=\"JVM_ARGS=-Dlog4j.configurationFile=file:///etc/aws-kinesis/log4j.xml\"\nExecStart=/usr/bin/start-aws-kinesis-agent -c /etc/aws-kinesis/agent.json\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=90\nUMask=0027\n[Install]\nWantedBy=multi-user.target\nUNIT\nprintf '# Managed by native systemd service; legacy babysitter disabled.\\n' >/etc/cron.d/aws-kinesis-agent\nmkdir -p /etc/systemd/system/aws-kinesis-agent.service.d\ncat >/etc/systemd/system/aws-kinesis-agent.service.d/java-memory.conf <<'UNIT'\n[Service]\nEnvironment=\"JAVA_START_HEAP=32m\"\nEnvironment=\"JAVA_MAX_HEAP=128m\"\nUNIT\n# Preserve agent evidence too; no default seven-day log expiration.\ncat >/etc/aws-kinesis/log4j.xml <<'LOG4J'\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Configuration>\n  <Appenders>\n    <File name=\"FILE\" fileName=\"/var/log/aws-kinesis-agent/aws-kinesis-agent.log\">\n      <PatternLayout pattern=\"%d{yyyy-MM-dd HH:mm:ss.SSSZ} (%t) %c [%p] %m%n\" />\n    </File>\n  </Appenders>\n  <Loggers>\n    <Logger name=\"com.amazon.kinesis.streaming.agent.tailing.FirehoseSender\" level=\"debug\" />\n    <Root level=\"info\"><AppenderRef ref=\"FILE\" /></Root>\n  </Loggers>\n</Configuration>\nLOG4J\nsystemctl daemon-reload\nsquid -k parse\nsystemctl enable --now squid\nsystemctl enable --now aws-kinesis-agent\nsystemctl is-active --quiet squid\nsystemctl is-active --quiet aws-kinesis-agent\nrpm -q squid aws-kinesis-agent > /var/log/squid-agent-versions.txt\n\"$JAVA17\" -version >> /var/log/squid-agent-versions.txt 2>&1\nsleep 5\nsystemctl is-active --quiet aws-kinesis-agent\n"
+          }
+        },
+        "BlockDeviceMappings": [
+          {
+            "DeviceName": "/dev/xvda",
+            "Ebs": {
+              "VolumeSize": 8,
+              "VolumeType": "gp3",
+              "Encrypted": true,
+              "DeleteOnTermination": true
+            }
+          }
+        ]
+      },
+      "CreationPolicy": {
+        "ResourceSignal": {
+          "Count": 1,
+          "Timeout": "PT15M"
+        }
+      }
+    },
+    "InternalNlb": {
+      "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-nlb"
+        },
+        "Scheme": "internal",
+        "Type": "network",
+        "IpAddressType": "ipv4",
+        "Subnets": [
+          {
+            "Ref": "PublicSubnetAz1"
+          },
+          {
+            "Ref": "PublicSubnetAz2"
+          }
+        ],
+        "SecurityGroups": [
+          {
+            "Ref": "NlbSecurityGroup"
+          }
+        ],
+        "EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic": "on",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab"
+          }
+        ],
+        "LoadBalancerAttributes": [
+          {
+            "Key": "load_balancing.cross_zone.enabled",
+            "Value": "false"
+          }
+        ]
+      }
+    },
+    "ProxyTargetGroup": {
+      "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-tg"
+        },
+        "VpcId": {
+          "Ref": "ProviderVpc"
+        },
+        "TargetType": "instance",
+        "Protocol": "TCP",
+        "Port": 3128,
+        "HealthCheckEnabled": true,
+        "HealthCheckProtocol": "TCP",
+        "HealthCheckPort": "3128",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-provider-tg"
+          }
+        ],
+        "Targets": [
+          {
+            "Id": {
+              "Ref": "SquidInstanceAz1"
+            },
+            "Port": 3128
+          },
+          {
+            "Id": {
+              "Ref": "SquidInstanceAz2"
+            },
+            "Port": 3128
+          }
+        ]
+      }
+    },
+    "ProxyListener": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Properties": {
+        "LoadBalancerArn": {
+          "Ref": "InternalNlb"
+        },
+        "Port": 3128,
+        "Protocol": "TCP",
+        "DefaultActions": [
+          {
+            "Type": "forward",
+            "TargetGroupArn": {
+              "Ref": "ProxyTargetGroup"
+            }
+          }
+        ]
+      }
+    },
+    "EndpointService": {
+      "Type": "AWS::EC2::VPCEndpointService",
+      "DependsOn": "ProxyListener",
+      "Properties": {
+        "AcceptanceRequired": true,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-provider-endpoint-service"
+          },
+          {
+            "Key": "Lab",
+            "Value": "PrivateLinkProxyLab"
+          }
+        ],
+        "NetworkLoadBalancerArns": [
+          {
+            "Ref": "InternalNlb"
+          }
+        ]
+      }
+    },
+    "EndpointServicePermission": {
+      "Type": "AWS::EC2::VPCEndpointServicePermissions",
+      "Properties": {
+        "ServiceId": {
+          "Ref": "EndpointService"
+        },
+        "AllowedPrincipals": [
+          {
+            "Fn::Sub": "arn:aws:iam::${ConsumerAccountId}:root"
+          }
+        ]
+      }
+    },
+    "SetAgentModeDocument": {
+      "Type": "AWS::SSM::Document",
+      "Properties": {
+        "DocumentType": "Command",
+        "Content": {
+          "schemaVersion": "2.2",
+          "description": "Change aggregation and poll settings without deleting checkpoints; generate no logs.",
+          "parameters": {
+            "AggregateBytes": {
+              "type": "String",
+              "default": "0",
+              "allowedValues": [
+                "0",
+                "5120",
+                "51200"
+              ],
+              "interpolationType": "ENV_VAR"
+            },
+            "PollMillis": {
+              "type": "String",
+              "default": "100",
+              "allowedValues": [
+                "100",
+                "1000",
+                "5000"
+              ],
+              "interpolationType": "ENV_VAR"
+            }
+          },
+          "mainSteps": [
+            {
+              "action": "aws:runShellScript",
+              "name": "SetMode",
+              "inputs": {
+                "timeoutSeconds": "120",
+                "runCommand": [
+                  "set -eu",
+                  "systemctl stop aws-kinesis-agent",
+                  "jq --argjson a \"$SSM_AggregateBytes\" --argjson p \"$SSM_PollMillis\" '.flows[0].aggregatedRecordSizeBytes=$a | .flows[0].minTimeBetweenFilePollsMillis=$p' /etc/aws-kinesis/agent.json >/etc/aws-kinesis/agent.json.new",
+                  "chmod 0644 /etc/aws-kinesis/agent.json.new",
+                  "mv /etc/aws-kinesis/agent.json.new /etc/aws-kinesis/agent.json",
+                  "systemctl start aws-kinesis-agent",
+                  "cat /etc/aws-kinesis/agent.json",
+                  "systemctl is-active aws-kinesis-agent"
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "FirehoseEndpointSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Firehose PrivateLink: HTTPS from Squid EC2 security group only",
+        "VpcId": {
+          "Ref": "ProviderVpc"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "SourceSecurityGroupId": {
+              "Ref": "ProxySecurityGroup"
+            },
+            "Description": "Kinesis Agent HTTPS to Firehose"
+          }
+        ],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "CidrIp": "127.0.0.1/32",
+            "Description": "No initiated outbound connections; response traffic is stateful"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-firehose-endpoint-sg"
+            }
+          }
+        ]
+      }
+    },
+    "FirehoseEndpoint": {
+      "Type": "AWS::EC2::VPCEndpoint",
+      "Properties": {
+        "VpcEndpointType": "Interface",
+        "VpcId": {
+          "Ref": "ProviderVpc"
+        },
+        "ServiceName": {
+          "Fn::Sub": "com.amazonaws.${AWS::Region}.kinesis-firehose"
+        },
+        "PrivateDnsEnabled": true,
+        "SubnetIds": [
+          {
+            "Ref": "PublicSubnetAz1"
+          },
+          {
+            "Ref": "PublicSubnetAz2"
+          }
+        ],
+        "SecurityGroupIds": [
+          {
+            "Ref": "FirehoseEndpointSecurityGroup"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "firehose:PutRecordBatch",
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${FirehoseStreamName}"
+              },
+              "Condition": {
+                "ArnEquals": {
+                  "aws:PrincipalArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-ec2-ssm-role"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-firehose-endpoint"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "ServiceName": {
+      "Description": "Supply this exact string as ServiceName when deploying consumer stack.",
+      "Value": {
+        "Fn::Sub": "com.amazonaws.vpce.${AWS::Region}.${EndpointService}"
+      }
+    },
+    "ServiceId": {
+      "Value": {
+        "Ref": "EndpointService"
+      }
+    },
+    "ProviderAzId1": {
+      "Value": {
+        "Fn::GetAtt": [
+          "PublicSubnetAz1",
+          "AvailabilityZoneId"
+        ]
+      }
+    },
+    "ProxyPublicIpAz1": {
+      "Description": "One of two possible public egress IPs returned by checkip.amazonaws.com",
+      "Value": {
+        "Fn::GetAtt": [
+          "SquidInstanceAz1",
+          "PublicIp"
+        ]
+      }
+    },
+    "SquidInstanceIdAz1": {
+      "Description": "Squid EC2 AZ1 instance ID.",
+      "Value": {
+        "Ref": "SquidInstanceAz1"
+      }
+    },
+    "ProviderAzId2": {
+      "Value": {
+        "Fn::GetAtt": [
+          "PublicSubnetAz2",
+          "AvailabilityZoneId"
+        ]
+      }
+    },
+    "ProxyPublicIpAz2": {
+      "Description": "Second possible public egress IP returned by checkip.amazonaws.com.",
+      "Value": {
+        "Fn::GetAtt": [
+          "SquidInstanceAz2",
+          "PublicIp"
+        ]
+      }
+    },
+    "SquidInstanceIdAz2": {
+      "Description": "Squid EC2 AZ2 instance ID.",
+      "Value": {
+        "Ref": "SquidInstanceAz2"
+      }
+    },
+    "SetAgentModeDocument": {
+      "Value": {
+        "Ref": "SetAgentModeDocument"
+      }
+    },
+    "TargetGroupArn": {
+      "Value": {
+        "Ref": "ProxyTargetGroup"
+      }
+    },
+    "FirehoseStreamName": {
+      "Value": {
+        "Ref": "FirehoseStreamName"
+      }
+    },
+    "FirehoseEndpointId": {
+      "Value": {
+        "Ref": "FirehoseEndpoint"
+      },
+      "Description": "Firehose private interface endpoint in both provider AZs; private DNS enabled."
+    },
+    "FirehoseEndpointSecurityGroupId": {
+      "Value": {
+        "Ref": "FirehoseEndpointSecurityGroup"
+      }
+    }
+  }
+}

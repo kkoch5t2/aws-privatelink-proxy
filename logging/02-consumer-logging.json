@@ -1,0 +1,349 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "PrivateLink consumer for finite real Squid requests. No Firehose client or direct Internet route.",
+  "Parameters": {
+    "ServiceName": {
+      "Type": "String",
+      "AllowedPattern": "^com\\.amazonaws\\.vpce\\.[a-z0-9-]+\\.vpce-svc-[0-9a-f]+$",
+      "Description": "ServiceName output of provider stack in account A."
+    },
+    "ProviderAzId1": {
+      "Type": "String",
+      "Default": "apse2-az1",
+      "Description": "MUST match the ProviderAzId1 output of A (AZ names differ across AWS accounts)."
+    },
+    "ProviderAzId2": {
+      "Type": "String",
+      "Default": "apse2-az2",
+      "Description": "MUST match ProviderAzId2 output from provider (same physical AZ across accounts)."
+    }
+  },
+  "Resources": {
+    "ConsumerVpc": {
+      "Type": "AWS::EC2::VPC",
+      "Properties": {
+        "CidrBlock": "10.241.0.0/16",
+        "EnableDnsSupport": true,
+        "EnableDnsHostnames": true,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-consumer"
+          },
+          {
+            "Key": "Lab",
+            "Value": "PrivateLinkProxyLab"
+          }
+        ]
+      }
+    },
+    "PrivateSubnetAz1": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "VpcId": {
+          "Ref": "ConsumerVpc"
+        },
+        "CidrBlock": "10.241.1.0/24",
+        "AvailabilityZoneId": {
+          "Ref": "ProviderAzId1"
+        },
+        "MapPublicIpOnLaunch": false,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-consumer-private-az1"
+          }
+        ]
+      }
+    },
+    "PrivateSubnetAz2": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "VpcId": {
+          "Ref": "ConsumerVpc"
+        },
+        "CidrBlock": "10.241.2.0/24",
+        "AvailabilityZoneId": {
+          "Ref": "ProviderAzId2"
+        },
+        "MapPublicIpOnLaunch": false,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-consumer-private-az2"
+          }
+        ]
+      }
+    },
+    "LambdaSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "VpcId": {
+          "Ref": "ConsumerVpc"
+        },
+        "GroupDescription": "PrivateLink lab Lambda client; no inbound rules",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-consumer-lambda-sg"
+          }
+        ]
+      }
+    },
+    "EndpointSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "VpcId": {
+          "Ref": "ConsumerVpc"
+        },
+        "GroupDescription": "Allow proxy port 3128 from lab Lambda only",
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 3128,
+            "ToPort": 3128,
+            "SourceSecurityGroupId": {
+              "Ref": "LambdaSecurityGroup"
+            },
+            "Description": "Allow TCP 3128 only from Lambda security group"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-consumer-vpce-sg"
+          }
+        ]
+      }
+    },
+    "ConsumerEndpoint": {
+      "Type": "AWS::EC2::VPCEndpoint",
+      "Properties": {
+        "VpcEndpointType": "Interface",
+        "ServiceName": {
+          "Ref": "ServiceName"
+        },
+        "VpcId": {
+          "Ref": "ConsumerVpc"
+        },
+        "SubnetIds": [
+          {
+            "Ref": "PrivateSubnetAz1"
+          },
+          {
+            "Ref": "PrivateSubnetAz2"
+          }
+        ],
+        "SecurityGroupIds": [
+          {
+            "Ref": "EndpointSecurityGroup"
+          }
+        ],
+        "PrivateDnsEnabled": false,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "privatelink-proxy-lab-consumer-vpce"
+          },
+          {
+            "Key": "Lab",
+            "Value": "PrivateLinkProxyLab"
+          }
+        ]
+      }
+    },
+    "LambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "RoleName": {
+          "Fn::Sub": "${AWS::StackName}-lambda-role"
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+        ]
+      }
+    },
+    "ProxyClientLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${AWS::StackName}-test"
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "ProxyClientFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "ProxyClientLogGroup",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AWS::StackName}-test"
+        },
+        "Description": "Call this manually to verify egress through A's Squid via PrivateLink.",
+        "Runtime": "python3.13",
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "LambdaRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 60,
+        "MemorySize": 128,
+        "Tags": [
+          {
+            "Key": "Lab",
+            "Value": "PrivateLinkProxyLab"
+          }
+        ],
+        "VpcConfig": {
+          "SubnetIds": [
+            {
+              "Ref": "PrivateSubnetAz1"
+            },
+            {
+              "Ref": "PrivateSubnetAz2"
+            }
+          ],
+          "SecurityGroupIds": [
+            {
+              "Ref": "LambdaSecurityGroup"
+            }
+          ]
+        },
+        "Environment": {
+          "Variables": {
+            "PROXY_HOST": {
+              "Fn::Select": [
+                1,
+                {
+                  "Fn::Split": [
+                    ":",
+                    {
+                      "Fn::Select": [
+                        0,
+                        {
+                          "Fn::GetAtt": [
+                            "ConsumerEndpoint",
+                            "DnsEntries"
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "PROXY_PORT": "3128",
+            "PROXY_DNS_ENTRIES": {
+              "Fn::Join": [
+                "|",
+                {
+                  "Fn::GetAtt": [
+                    "ConsumerEndpoint",
+                    "DnsEntries"
+                  ]
+                }
+              ]
+            },
+            "PROXY_AZ1_NAME": {
+              "Fn::GetAtt": [
+                "PrivateSubnetAz1",
+                "AvailabilityZone"
+              ]
+            },
+            "PROXY_AZ2_NAME": {
+              "Fn::GetAtt": [
+                "PrivateSubnetAz2",
+                "AvailabilityZone"
+              ]
+            }
+          }
+        },
+        "Code": {
+          "ZipFile": "import os, http.client, ssl, time, re\n\ndef handler(event, context):\n    # This generates HTTPS requests, not Firehose records. Kinesis Agent collects the log.\n    count = int(event.get(\"count\", 1))\n    interval = float(event.get(\"interval\", 0))\n    route = event.get(\"route\", \"regional\")\n    run = event.get(\"run\", \"smoke\")\n    if not 1 <= count <= 20 or not 0 <= interval <= 1 or not re.fullmatch(r\"[a-zA-Z0-9_-]{1,48}\",run):\n        raise ValueError(\"Finite requests only: count 1..20, interval 0..1, safe run ID\")\n    host = os.environ[\"PROXY_HOST\"]\n    if route in (\"az1\",\"az2\"):\n        zone = os.environ[\"PROXY_\" + route.upper() + \"_NAME\"]\n        candidates = [x.split(\":\",1)[1] for x in os.environ[\"PROXY_DNS_ENTRIES\"].split(\"|\")]\n        matches = [x for x in candidates if x.split(\".\",1)[0].endswith(\"-\"+zone)]\n        if len(matches) != 1:\n            raise ValueError(\"Zonal DNS could not be identified unambiguously\")\n        host = matches[0]\n    elif route != \"regional\":\n        raise ValueError(\"route must be regional, az1 or az2\")\n    rows=[]\n    for i in range(count):\n        request_id=\"{}-{:03d}\".format(run,i)\n        started=time.time()\n        conn=http.client.HTTPSConnection(host,int(os.environ[\"PROXY_PORT\"]),timeout=8,context=ssl.create_default_context())\n        conn.set_tunnel(\"checkip.amazonaws.com\",443,headers={\"X-Lab-Request\":request_id})\n        try:\n            conn.request(\"GET\",\"/\",headers={\"Connection\":\"close\",\"User-Agent\":\"squid-agent-lab/1.0\"})\n            response=conn.getresponse()\n            body=response.read(256).decode().strip()\n            rows.append({\"request_id\":request_id,\"started\":started,\"finished\":time.time(),\"status\":response.status,\"egress_ip\":body})\n        except Exception as exc:\n            rows.append({\"request_id\":request_id,\"started\":started,\"finished\":time.time(),\"error\":type(exc).__name__})\n        finally:\n            conn.close()\n        if context.get_remaining_time_in_millis() < 12000:\n            break\n        if interval: time.sleep(interval)\n    return {\"run\":run,\"route\":route,\"proxy\":host,\"requests\":rows,\"requested\":count}\n"
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "ConsumerEndpointId": {
+      "Value": {
+        "Ref": "ConsumerEndpoint"
+      }
+    },
+    "ConsumerEndpointRegionalHostname": {
+      "Description": "Private hostname of regional interface VPC endpoint used by Lambda.",
+      "Value": {
+        "Fn::Select": [
+          1,
+          {
+            "Fn::Split": [
+              ":",
+              {
+                "Fn::Select": [
+                  0,
+                  {
+                    "Fn::GetAtt": [
+                      "ConsumerEndpoint",
+                      "DnsEntries"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "TestLambdaName": {
+      "Value": {
+        "Ref": "ProxyClientFunction"
+      }
+    },
+    "ConsumerVpcId": {
+      "Value": {
+        "Ref": "ConsumerVpc"
+      }
+    },
+    "SubnetIdAz1": {
+      "Value": {
+        "Ref": "PrivateSubnetAz1"
+      }
+    },
+    "ConsumerAzId1": {
+      "Value": {
+        "Fn::GetAtt": [
+          "PrivateSubnetAz1",
+          "AvailabilityZoneId"
+        ]
+      }
+    },
+    "SubnetIdAz2": {
+      "Value": {
+        "Ref": "PrivateSubnetAz2"
+      }
+    },
+    "ConsumerAzId2": {
+      "Value": {
+        "Fn::GetAtt": [
+          "PrivateSubnetAz2",
+          "AvailabilityZoneId"
+        ]
+      }
+    }
+  }
+}
